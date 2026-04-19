@@ -14,13 +14,13 @@
 '''Note that you need to check if it exceeds max_rec_post_len when writing
 into rec_matrix'''
 import heapq
+import json
 import logging
+import math
 import random
 import time
 from ast import literal_eval
 from datetime import datetime
-import json
-import math
 from math import log
 from typing import Any, Dict, List
 
@@ -873,6 +873,13 @@ def _evaluate_traffic_pools(
         pools.setdefault(level, []).append(v)
 
     for level, videos in pools.items():
+        # Level 0 videos are considered out of circulation and should not
+        # re-enter the promotion race in later refresh cycles.
+        if level <= 0:
+            for v in videos:
+                v["_pool_action"] = "stay"
+            continue
+
         if len(videos) < 2:
             for v in videos:
                 v["_pool_action"] = "stay"
@@ -940,7 +947,9 @@ def rec_sys_tiktok(
     user_table: List[Dict[str, Any]],
     post_table: List[Dict[str, Any]],
     video_table: List[Dict[str, Any]],
+    comment_table: List[Dict[str, Any]],
     trace_table: List[Dict[str, Any]],
+    follow_table: List[Dict[str, Any]],
     rec_matrix: List[List[int]],
     max_rec_post_len: int,
     refresh_rec_post_count: int = 8,
@@ -974,14 +983,22 @@ def rec_sys_tiktok(
     if not post_table or not user_table:
         return rec_matrix
 
-    video_lookup = {v["post_id"]: v for v in video_table} if video_table else {}
+    video_lookup = (
+        {v["post_id"]: v for v in video_table} if video_table else {})
 
     post_lookup = {p["post_id"]: p for p in post_table}
+
+    comment_count_by_post: Dict[int, int] = {}
+    for comment in comment_table or []:
+        post_id = comment.get("post_id")
+        if post_id is not None:
+            comment_count_by_post[post_id] = (
+                comment_count_by_post.get(post_id, 0) + 1)
 
     for v in video_table:
         post = post_lookup.get(v["post_id"], {})
         v["num_likes"] = post.get("num_likes", 0)
-        v["num_comments"] = post.get("num_comments", 0)
+        v["num_comments"] = comment_count_by_post.get(v["post_id"], 0)
         v.setdefault("share_count", 0)
         v.setdefault("negative_count", 0)
 
@@ -994,23 +1011,19 @@ def rec_sys_tiktok(
         and v.get("traffic_pool_level", 1) > 0  # level 0 = previously demoted
     ]
 
-    # Build follow graph from trace (follow action stores followee_id)
+    # Build follow graph from current follow table state so unfollow actions
+    # are reflected immediately in recommendation behavior.
     follow_map: Dict[int, set] = {}
-    for trace in trace_table:
-        if trace.get("action") == ActionType.FOLLOW.value:
-            uid = trace["user_id"]
-            try:
-                info = trace.get("info", "{}")
-                if isinstance(info, str):
-                    info = json.loads(info)
-                # Platform.follow() stores followee_id in action_info
-                followed = (info.get("followee_id")
-                            or info.get("user_id")
-                            or info.get("follow_id"))
-                if followed is not None:
-                    follow_map.setdefault(uid, set()).add(int(followed))
-            except (json.JSONDecodeError, AttributeError, ValueError):
-                pass
+    for relation in follow_table or []:
+        follower_id = relation.get("follower_id")
+        followee_id = relation.get("followee_id")
+        if follower_id is None or followee_id is None:
+            continue
+        try:
+            follow_map.setdefault(int(follower_id), set()).add(
+                int(followee_id))
+        except (TypeError, ValueError):
+            continue
 
     post_creator = {p["post_id"]: p["user_id"] for p in post_table}
 
@@ -1031,7 +1044,8 @@ def rec_sys_tiktok(
             post = post_lookup.get(pid, {})
             td = _time_decay_72h(post.get("created_at"), max_step,
                                  decay_half_life)
-            video_base_scores[pid] = pool_weight * pool_score + time_weight * td
+            video_base_scores[pid] = (
+                pool_weight * pool_score + time_weight * td)
 
     # Build video topic lookup for personalization
     video_topics: Dict[int, set] = {}
